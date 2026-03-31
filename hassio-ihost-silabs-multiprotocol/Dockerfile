@@ -1,6 +1,6 @@
 ARG BUILD_FROM
 ARG BUILD_ARCH
-FROM --platform=linux/amd64 debian:bullseye AS cross-builder-base
+FROM --platform=linux/amd64 debian:trixie AS cross-builder-base
 
 ENV \
     LANG="C.UTF-8" \
@@ -42,7 +42,7 @@ COPY debian-arm64.cmake /usr/src/debian.cmake
 
 ENV DEBIAN_ARCH=arm64
 ENV DEBIAN_CROSS_PREFIX=aarch64-linux-gnu
-ENV SLC_ARCH=linux_arch_64
+ENV SLC_ARCH=zigbee_arm64
 
 RUN \
     set -x \
@@ -76,7 +76,7 @@ RUN \
     && apt-get install -y --no-install-recommends \
        cmake \
        "libmbedtls-dev:${DEBIAN_ARCH}" \
-       "libmbedtls12:${DEBIAN_ARCH}" \
+       "libmbedtls21:${DEBIAN_ARCH}" \
     && git clone --depth 1 -b "${CPCD_VERSION}" \
        https://github.com/SiliconLabs/cpc-daemon.git \
     && mkdir $CPCD_DIR/build && cd $CPCD_DIR/build \
@@ -90,15 +90,13 @@ FROM --platform=linux/amd64 cross-builder-${BUILD_ARCH} AS zigbeed-builder
 
 ARG GECKO_SDK_VERSION
 
-COPY slc_cli_linux.zip /usr/src/slc_cli_linux.zip
-
 RUN \
     set -x \
     && apt-get install -y --no-install-recommends \
        python3 \
        python3-jinja2 \
        python3-pip \
-       openjdk-17-jre \
+       openjdk-21-jre \
        git-lfs \
        unzip \
     && curl -O https://www.silabs.com/documents/login/software/slc_cli_linux.zip \
@@ -107,24 +105,19 @@ RUN \
  
 ENV PATH="/usr/src/slc_cli/:$PATH"
 
-RUN \
-    set -x \
-    && git clone --depth 1 -b ${GECKO_SDK_VERSION} \
-        https://github.com/SiliconLabs/simplicity_sdk.git gecko_sdk
+# Copy local gecko_sdk instead of cloning (saves time/bandwidth)
+COPY gecko_sdk /usr/src/gecko_sdk
 
 # zigbeed links against libcpc.so
 COPY --from=cpcd-builder /usr/local/ /usr/${DEBIAN_CROSS_PREFIX}/
-COPY otbr-patches/0001-Avoid-writing-to-system-console.patch /usr/src
-COPY otbr-patches/0001-rest-support-deleting-the-dataset.patch /usr/src
 
 RUN \
     set -x \
     && cd gecko_sdk \
-    && patch -p1 < /usr/src/0001-Avoid-writing-to-system-console.patch \
-    && patch -p1 < /usr/src/0001-rest-support-deleting-the-dataset.patch \
     && GECKO_SDK=$(pwd) \
     && slc signature trust --sdk=${GECKO_SDK} \
     && cd protocol/zigbee \
+    && sed -i '/zigbee_recommended_linux_arch/d' app/projects/zigbeed/zigbeed.slcp \
     && slc generate \
        --sdk=${GECKO_SDK} \
        --with="${SLC_ARCH}" \
@@ -140,119 +133,116 @@ RUN \
         C_FLAGS="-std=gnu99 -DEMBER_MULTICAST_TABLE_SIZE=16" \
         debug
 
-FROM $BUILD_FROM
+# OTBR builder stage - based on mainline otbr approach
+FROM --platform=linux/amd64 cross-builder-${BUILD_ARCH} AS otbr-builder
 
-
-RUN \
-    set -x \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-       libmbedtls12 \
-       socat \
-    && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /usr/src/*
-
-
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/util/third_party/ot-br-posix /usr/src/ot-br-posix
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/util/third_party/openthread /usr/src/openthread
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/protocol/openthread/platform-abstraction/posix/ /usr/src/silabs-vendor-interface
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/protocol/openthread/platform-abstraction/posix/openthread-core-silabs-posix-config.h /usr/src/openthread/src/posix/platform/openthread-core-silabs-posix-config.h
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/protocol/openthread /usr/src/protocol/openthread
-COPY --from=zigbeed-builder \
-     /usr/src/gecko_sdk/protocol/zigbee/app/projects/zigbeed/output/build/debug/zigbeed /usr/local/bin
-COPY --from=cpcd-builder /usr/local/ /usr/local/
-
-COPY rootfs /
+ARG OTBR_VERSION
 
 ENV BORDER_ROUTING=1
 ENV BACKBONE_ROUTER=1
+ENV PLATFORM=debian
+ENV RELEASE=1
 ENV WEB_GUI=1
-ENV DOCKER 1
+ENV REST_API=1
+ENV DOCKER=1
 
-
-# Required and installed during build (script/bootstrap), could be removed
-
-ENV OTBR_BUILD_DEPS build-essential ninja-build cmake wget ca-certificates \
-  libreadline-dev libncurses-dev libcpputest-dev libdbus-1-dev libavahi-common-dev \
-  libavahi-client-dev libboost-dev libboost-filesystem-dev libboost-system-dev \
-  libnetfilter-queue-dev
-
-# Build OTBR natively from Gecko SDK sources
+COPY otbr-patches/0001-Avoid-writing-to-system-console.patch /usr/src/
+COPY otbr-patches/0001-channel-monitor-disable-by-default.patch /usr/src/
+COPY otbr-patches/0001-rest-support-deleting-the-dataset.patch /usr/src/
+COPY otbr-patches/0002-spinel-Clear-source-match-tables-before-restoring.patch /usr/src/
 
 WORKDIR /usr/src
 RUN \
     set -x \
     && apt-get update \
-    # Install npm/nodejs for WebUI manually to avoid systemd getting pulled in \
-    && apt-get install -y --no-install-recommends \
-       nodejs \
-       npm \
-       iproute2 \
-       patch \
-       python3 \
-       python3-dev \
-       python3-pip \
-       python3-aiohttp \
-       python3-cryptography \
-       python3-yarl \
-       lsb-release \
-       netcat \
-       sudo \
-    && cd ot-br-posix \
-    && ln -s ../../../openthread/ third_party/openthread/repo \
-    && chmod +x ./script/* \
-    && RELEASE=1 REFERENCE_DEVICE=1 BACKBONE_ROUTER=1 NAT64=1 DNS64=1 ./script/bootstrap \
-    # Mimic rt_tables_install \
-    && echo "88 openthread" >> /etc/iproute2/rt_tables \
-    # Mimic otbr_install \
-    && (./script/cmake-build \
+    # The OTBR build script tries to run `sudo`
+    && apt-get install -y --no-install-recommends sudo git \
+    && git clone --depth 1 -b main https://github.com/openthread/ot-br-posix.git /usr/src/ot-br-posix \
+    && cd /usr/src/ot-br-posix \
+    && git fetch origin ${OTBR_VERSION} \
+    && git checkout ${OTBR_VERSION} \
+    && git submodule update --init \
+    # Bootstrap downloads a few more repos
+    && ./script/bootstrap \
+    # Remove libsystemd-dev to avoid unnecessary linkage
+    && apt-get purge -y libsystemd-dev
+
+WORKDIR /usr/src/ot-br-posix
+RUN \
+    set -x \
+    && patch -p1 < /usr/src/0001-Avoid-writing-to-system-console.patch \
+    && patch -p1 < /usr/src/0001-rest-support-deleting-the-dataset.patch \
+    && ( \
+        cd third_party/openthread/repo \
+        && patch -p1 < /usr/src/0001-channel-monitor-disable-by-default.patch \
+        && patch -p1 < /usr/src/0002-spinel-Clear-source-match-tables-before-restoring.patch \
+    ) \
+    && ./script/cmake-build \
         -DBUILD_TESTING=OFF \
         -DCMAKE_INSTALL_PREFIX=/usr \
         -DOTBR_FEATURE_FLAGS=ON \
         -DOTBR_DNSSD_DISCOVERY_PROXY=ON \
         -DOTBR_SRP_ADVERTISING_PROXY=ON \
-        -DOTBR_INFRA_IF_NAME=eth0 \
         -DOTBR_MDNS=mDNSResponder \
         -DOTBR_VERSION= \
         -DOT_PACKAGE_VERSION= \
         -DOTBR_DBUS=OFF \
-        -DOT_THREAD_VERSION=1.4 \
-        -DOT_MULTIPAN_RCP=ON \
-        -DCPCD_SOURCE_DIR=$CPCD_DIR \
-        -DOT_POSIX_RCP_VENDOR_BUS=ON \
-        -DOT_POSIX_CONFIG_RCP_VENDOR_DEPS_PACKAGE=/usr/src/protocol/openthread/platform-abstraction/posix/posix_vendor_rcp.cmake \
-        -DOT_POSIX_CONFIG_RCP_VENDOR_INTERFACE=/usr/src/protocol/openthread/platform-abstraction/posix/cpc_interface.cpp \
-        -DOT_CLI_VENDOR_EXTENSION=/usr/src/protocol/openthread/platform-abstraction/posix/posix_vendor_cli.cmake \
-        -DOT_PLATFORM_CONFIG="openthread-core-silabs-posix-config.h" \
+        -DOT_POSIX_RCP_BUS_UART=ON \
         -DOT_LINK_RAW=1 \
-        -DOTBR_VENDOR_NAME="OpenThread" \
+        -DOTBR_VENDOR_NAME="Home Assistant" \
         -DOTBR_PRODUCT_NAME="Silicon Labs Multiprotocol" \
         -DOTBR_WEB=ON \
         -DOTBR_BORDER_ROUTING=ON \
         -DOTBR_REST=ON \
         -DOTBR_BACKBONE_ROUTER=ON \
-        -DOTBR_DUA_ROUTING=ON \
-        && cd build/otbr/ \
-        && ninja \
-        && ninja install) \
-    && apt-get purge -y --auto-remove \
-       build-essential \
-       patch \
+        -DOTBR_TREL=ON \
+        -DOTBR_NAT64=ON \
+        -DOT_POSIX_NAT64_CIDR="192.168.255.0/24" \
+        -DOTBR_DNS_UPSTREAM_QUERY=ON \
+        -DOT_CHANNEL_MONITOR=ON \
+        -DOT_COAP=OFF \
+        -DOT_COAPS=OFF \
+        -DOT_DNS_CLIENT_OVER_TCP=OFF \
+        -DOT_THREAD_VERSION=1.4 \
+        -DOT_RCP_RESTORATION_MAX_COUNT=2 \
+    && cd /usr/src/ot-br-posix/build/otbr \
+    && ninja install
+
+FROM $BUILD_FROM
+
+ARG UNIVERSAL_SILABS_FLASHER_VERSION
+
+RUN \
+    set -x \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       python3 \
        python3-pip \
-       python3-dev \
-       git \
-       git-lfs \
-       libmbedtls-dev \
-       ${OTBR_BUILD_DEPS} \
+       netcat-openbsd \
+       socat \
+       iproute2 \
+       iputils-ping \
+       ipset \
+       iptables \
+       libreadline8 \
+       libncurses6 \
+       libmbedtls21 \
+    && pip install --break-system-packages --no-cache-dir \
+       universal-silabs-flasher==${UNIVERSAL_SILABS_FLASHER_VERSION} \
     && rm -rf /var/lib/apt/lists/* \
-    && rm -rf /usr/src/* \
-    && ldconfig \
-    && touch /accept_silabs_msla 
+    && rm -rf /usr/src/*
+
+# Setup routing table for OpenThread
+RUN \
+    mkdir -p /etc/iproute2 \
+    && echo "88 openthread" >> /etc/iproute2/rt_tables
+
+COPY --from=otbr-builder /usr /usr
+COPY --from=cpcd-builder /usr/local/ /usr/local/
+COPY --from=zigbeed-builder \
+     /usr/src/gecko_sdk/protocol/zigbee/app/projects/zigbeed/output/build/debug/zigbeed /usr/local/bin
+
+COPY rootfs /
 
 ENV \
     S6_STAGE2_HOOK=/etc/s6-overlay/scripts/enable-check.sh
@@ -261,4 +251,5 @@ HEALTHCHECK --interval=10s --start-period=120s CMD [ "$(s6-svstat -u /run/servic
 
 # use s6-overlay as init system
 WORKDIR /
+LABEL org.opencontainers.image.source="https://github.com/bepvte/hassio-ihost-addon"
 ENTRYPOINT ["/init"]
